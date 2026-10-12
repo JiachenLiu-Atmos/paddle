@@ -60,7 +60,9 @@ What this does not do:
 x1 ghost zones are rebuilt for reflecting walls, periodic seams and outflow,
 which holds the outermost active value. Any other boundary is refused, because
 Snapy does not refill ghosts when it loads a restart and a wrong ghost is read
-as if it were the real condition.
+as if it were the real condition. Snapy's characteristic outflow is refused
+too: it keeps a saved background in boundary_reference_*, which this tool does
+not map, and zero-gradient ghosts are not what it holds.
 
 The x1 ghost zones and the top --edge-skip active cells are dropped from the
 source first. The ghosts only mirror the wall, and the cells against it are not
@@ -701,6 +703,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             shape = tuple(tensors[key].shape)
             if len(shape) >= 2 and shape[-1] == old.nc1:
                 stale.append(f"{key}{list(shape)}" + (f" in {name}" if name else ""))
+    # Snapy's characteristic ("radiating") outflow keeps a saved background in
+    # boundary_reference_*, and refuses to load a restart that lost it. Those
+    # tensors are not mapped here, and the zero-gradient ghosts this tool
+    # writes are not what that boundary holds either.
+    reference = sorted(
+        {k for _, t in blocks for k in t if k.startswith("boundary_reference")}
+    )
+    if reference:
+        raise SystemExit(
+            "this restart carries " + ", ".join(reference) + ", which Snapy's "
+            "characteristic outflow keeps its background in. This tool neither "
+            "maps those tensors nor writes the ghosts that boundary expects. "
+            "Continue on the original grid, or re-initialise with the "
+            "extrapolation outflow."
+        )
+
     if stale:
         raise SystemExit(
             "this restart holds spatial field(s) on the x1 axis that this tool "

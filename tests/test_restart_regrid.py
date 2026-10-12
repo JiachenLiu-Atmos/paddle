@@ -527,3 +527,18 @@ def test_guard_still_catches_a_lapse_in_one_column(tmp_path) -> None:
     src = case(tmp_path, one_column_with_lapse)
     with pytest.raises(ValueError, match="one column spans"):
         run(src, "new.yaml", "out.restart")
+
+
+def test_characteristic_outflow_restart_is_refused(tmp_path) -> None:
+    """Snapy keeps that boundary's background in the restart; this tool does not map it."""
+
+    def with_reference(z, u, w, tensors):
+        grid = restart_regrid.Grid(OLD_CFG)
+        tensors["boundary_reference_w"] = torch.zeros(
+            (NVAR, grid.nc3, grid.nc2, 2 * NGHOST), dtype=torch.float64
+        )
+
+    src = case(tmp_path, with_reference)
+    with pytest.raises(SystemExit, match="boundary_reference_w"):
+        run(src, "new.yaml", "out.restart")
+    assert not (src / "out.restart").exists()

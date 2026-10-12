@@ -200,8 +200,8 @@ What it assumes, and what it refuses:
 | grid | uniform arithmetic cell centres from the YAML bounds; `x1min`, `nx3` and `nghost` must be unchanged |
 | horizontal | `nx2` must match unless `--x2-mode stretch` is given, which rescales existing eddies along with the domain |
 | state fields | only the four hydro arrays. A restart carrying anything else on the x1 axis, `scalar_s` above all, is refused rather than written at two vertical sizes |
-| boundaries | reflecting walls and periodic seams are rebuilt, outflow keeps the extrapolation, anything else is refused. Snapy does not refill ghosts on load, so a wrong ghost is read as the real condition |
-| hydrostatic balance | the extension is isothermal at the edge temperature. A source spanning more than 10% in `P/rho` over the fitted cells is refused unless `--allow-nonisothermal` is given. Gravity is never read, so balance is approximated, not verified |
+| boundaries | reflecting walls, periodic seams and outflow are rebuilt; outflow ghosts take the outermost active value. Anything else is refused. Snapy does not refill ghosts on load, so a wrong ghost is read as the real condition. Snapy's *characteristic* outflow is not supported: its restart carries boundary reference tensors this tool does not map, and it is refused by name |
+| hydrostatic balance | the extension is isothermal at each column's edge temperature. A *column* spanning more than 10% in `P/rho` over the fitted cells is refused unless `--allow-nonisothermal` is given; a horizontal temperature gradient is fine, since every column is fitted on its own. Gravity is never read, so balance is approximated, not verified |
 | conservation | not enforced. Column mass and energy move by the interpolation error plus whatever the extension adds |
 | output | written to a temporary file and renamed into place. An existing destination needs `--force`, and `--restart` may not equal `--output` |
 
