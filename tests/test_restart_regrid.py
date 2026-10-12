@@ -495,3 +495,35 @@ def test_overflow_in_the_output_type_is_refused() -> None:
     assert np.all(np.isfinite(full))
     with pytest.raises(ValueError, match="float32"):
         restart_regrid.regrid_state(arr, old, new, **kwargs, dtype=np.float32)
+
+
+def test_guard_allows_a_horizontal_temperature_gradient(tmp_path) -> None:
+    """Each column isothermal, the columns at different temperatures.
+
+    map_x1 fits and extends one column at a time, so a horizontal gradient is
+    something the extension handles. A guard that reduced across columns would
+    read it as a lapse rate and refuse a state the tool maps correctly.
+    """
+
+    def warm_one_side(z, u, w, tensors):
+        grid = restart_regrid.Grid(OLD_CFG)
+        # column j sits at its own temperature, flat in height
+        j = np.arange(grid.nc2).reshape(1, -1, 1)
+        w[4] = u[0] * CV_T * 0.4 * (1.0 + 0.5 * j / grid.nc2)
+
+    src = case(tmp_path, warm_one_side)
+    assert run(src, "new.yaml", "out.restart") == 0
+
+
+def test_guard_still_catches_a_lapse_in_one_column(tmp_path) -> None:
+    """Per column does not mean per plane: one bad column is enough."""
+
+    def one_column_with_lapse(z, u, w, tensors):
+        w[4] = u[0] * CV_T * 0.4
+        w[4, :, NGHOST + 2, :] = u[0, :, NGHOST + 2, :] * (
+            CV_T * 0.4 * (1.0 - 0.6 * z / 600.0e3)
+        )
+
+    src = case(tmp_path, one_column_with_lapse)
+    with pytest.raises(ValueError, match="one column spans"):
+        run(src, "new.yaml", "out.restart")

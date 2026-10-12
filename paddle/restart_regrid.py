@@ -383,15 +383,27 @@ def regrid_state(
             t_edge = t_edge[..., gh:-gh, :]
         if t_edge.shape[-3] > 2 * gh:
             t_edge = t_edge[gh:-gh, ...]
-        lo, hi = float(np.min(t_edge)), float(np.max(t_edge))
-        spread = (hi - lo) / hi if hi > 0 else float("inf")
+        # map_x1 fits and extends every column on its own, so the question is
+        # whether each column is isothermal over the window, not whether the
+        # whole plane is. Two columns that are each flat in P/rho but sit at
+        # different temperatures are a horizontal gradient, which the
+        # extension handles; reducing across them would read that as a lapse
+        # rate and refuse a state it maps correctly.
+        col_lo = np.min(t_edge, axis=-1)
+        col_hi = np.max(t_edge, axis=-1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            per_column = np.where(col_hi > 0.0, (col_hi - col_lo) / col_hi, np.inf)
+        worst = np.unravel_index(int(np.argmax(per_column)), per_column.shape)
+        spread = float(per_column[worst])
+        lo, hi = float(col_lo[worst]), float(col_hi[worst])
         print(
-            f"  edge P/rho over the top {window} fitted cells: "
+            f"  edge P/rho over the top {window} fitted cells, worst column: "
             f"{lo:.6g} to {hi:.6g} ({100 * spread:.2f}% spread)"
         )
         if spread > isothermal_tol:
             raise ValueError(
-                f"the top {window} source cells span {100 * spread:.1f}% in P/rho, "
+                f"one column spans {100 * spread:.1f}% in P/rho over its top "
+                f"{window} source cells, "
                 f"above the {100 * isothermal_tol:.0f}% this tool allows. The "
                 "extension is isothermal at the edge value and fits the density "
                 "slope, so on a column with this much lapse it will not be in "
