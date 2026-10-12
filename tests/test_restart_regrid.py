@@ -396,3 +396,102 @@ def test_non_isothermal_edge_is_refused_then_allowed(tmp_path) -> None:
     with pytest.raises(ValueError, match="hydrostatic balance"):
         run(src, "new.yaml", "out.restart")
     assert run(src, "new.yaml", "out.restart", "--allow-nonisothermal") == 0
+
+
+# --- the second review round ----------------------------------------------
+
+
+def test_energy_survives_the_horizontal_resample(tmp_path) -> None:
+    """Rebuilding the conserved state before the x2 map undoes the x1 fix.
+
+    resample_x2_periodic interpolates every slot on its own, so a momentum and
+    an energy that agreed after the vertical map stop agreeing after the
+    horizontal one unless both ride across in per-mass form.
+    """
+
+    def shear_in_x2(z, u, w, tensors):
+        grid = restart_regrid.Grid(OLD_CFG)
+        # velocity varies along x2 as well as x1, so the horizontal resample
+        # has something to get wrong
+        j = np.arange(grid.nc2).reshape(1, -1, 1)
+        vel = 3.0 + 1.0e-4 * z + 2.0 * j
+        u[1] = u[0] * vel
+        u[4] = u[0] * (CV_T + 0.5 * vel**2)
+        w[1] = vel
+
+    wide = config(760.0e3, 180, nx2=12)
+    src = case(tmp_path, shear_in_x2, new=wide)
+    assert run(src, "new.yaml", "out.restart", "--x2-mode", "stretch") == 0
+    arr = restart_regrid.read_part(str(src / "out.restart"))["hydro_u"].numpy()
+    grid = restart_regrid.Grid(wide)
+    act = arr[:, 0, NGHOST : NGHOST + grid.nx2, NGHOST : NGHOST + grid.nx1]
+    implied = act[4] / act[0] - 0.5 * (act[1] / act[0]) ** 2
+    assert np.allclose(implied, CV_T, rtol=1e-10)
+
+
+def test_temperature_guard_ignores_horizontal_ghosts(tmp_path) -> None:
+    """The lapse-rate guard describes the column, not the x2 ghost zones."""
+
+    def poison_x2_ghosts(z, u, w, tensors):
+        w[4, :, :NGHOST, :] *= 5.0  # nothing physical lives here
+        w[4, :, -NGHOST:, :] *= 5.0
+
+    src = case(tmp_path, poison_x2_ghosts)
+    assert run(src, "new.yaml", "out.restart") == 0
+
+
+def test_guard_window_matches_the_slope_fit(tmp_path, capsys) -> None:
+    """The guard reports the window fit_top_slope will use, not --edge-fit raw.
+
+    fit_top_slope floors the window at two cells, because a slope needs two
+    points. A guard that took --edge-fit literally would describe a different
+    set of cells from the one the extension is built out of, and at
+    --edge-fit 1 it would be reducing over a single value.
+    """
+    src = case(tmp_path, lambda *a: None)
+    assert run(src, "new.yaml", "out.restart", "--edge-fit", "1") == 0
+    reported = capsys.readouterr().out
+    assert "over the top 2 fitted cells" in reported
+    assert restart_regrid.fit_top_slope(np.arange(5.0), np.arange(5.0), 1) == pytest.approx(1.0)
+
+
+def test_outflow_ghosts_hold_the_edge_value(tmp_path) -> None:
+    out_cfg = {
+        **config(600.0e3, 142),
+        "boundary-condition": {
+            "external": {"x1-inner": "outflow", "x1-outer": "outflow"}
+        },
+    }
+    new_cfg = {
+        **config(760.0e3, 180),
+        "boundary-condition": {
+            "external": {"x1-inner": "outflow", "x1-outer": "outflow"}
+        },
+    }
+    src = case(tmp_path, lambda *a: None, old=out_cfg, new=new_cfg)
+    assert run(src, "new.yaml", "out.restart") == 0
+    arr = restart_regrid.read_part(str(src / "out.restart"))["hydro_u"].numpy()
+    nx1 = restart_regrid.Grid(new_cfg).nx1
+    # zero gradient: every ghost equals the active cell it sits against
+    for g in range(NGHOST):
+        assert np.array_equal(arr[..., g], arr[..., NGHOST])
+        assert np.array_equal(arr[..., -1 - g], arr[..., NGHOST + nx1 - 1])
+
+
+def test_overflow_in_the_output_type_is_refused() -> None:
+    """A value finite in float64 and infinite in float32 must not be written."""
+    old = restart_regrid.Grid(OLD_CFG)
+    new = restart_regrid.Grid(NEW_CFG)
+    roles = restart_regrid.variable_roles(NVAR, "default")
+    z = old.x1v()
+    # density climbing steeply with height: the extension continues the fitted
+    # log slope and leaves float32 behind without leaving float64
+    arr = np.zeros((NVAR, old.nc3, old.nc2, old.nc1), dtype=np.float64)
+    arr[0] = 1.0e30 * np.exp(z / 8.0e3)
+    arr[4] = arr[0] * CV_T
+
+    kwargs = dict(roles=roles, conserved=True, skip=2, nfit=12)
+    full = restart_regrid.regrid_state(arr, old, new, **kwargs, dtype=np.float64)
+    assert np.all(np.isfinite(full))
+    with pytest.raises(ValueError, match="float32"):
+        restart_regrid.regrid_state(arr, old, new, **kwargs, dtype=np.float32)

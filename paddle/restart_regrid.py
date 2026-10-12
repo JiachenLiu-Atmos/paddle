@@ -57,10 +57,10 @@ What this does not do:
                  the YAML bounds. Non-uniform or geometry-specific grids are
                  not supported.
 
-x1 ghost zones are rebuilt for reflecting walls and periodic seams; outflow
-keeps the smooth extrapolation, which is what a zero-gradient boundary asks
-for. Any other boundary is refused, because Snapy does not refill ghosts when
-it loads a restart and a wrong ghost is read as if it were the real condition.
+x1 ghost zones are rebuilt for reflecting walls, periodic seams and outflow,
+which holds the outermost active value. Any other boundary is refused, because
+Snapy does not refill ghosts when it loads a restart and a wrong ghost is read
+as if it were the real condition.
 
 The x1 ghost zones and the top --edge-skip active cells are dropped from the
 source first. The ghosts only mirror the wall, and the cells against it are not
@@ -289,8 +289,11 @@ def fill_x1_ghosts(
     argument applies: the extrapolation is not that, and because the loader
     does not refill, no later exchange is guaranteed to correct it.
 
-    Outflow keeps the extrapolation, which is what a zero-gradient boundary
-    asks for. Anything else is rejected by check_x1_bc before this runs.
+    Outflow copies the outermost active cell into its ghosts, which is what a
+    zero-gradient boundary holds. The smooth extrapolation left there before
+    was not that: it continues the fitted slope, so the ghost carries a
+    gradient the boundary says is zero. Anything else is rejected by
+    check_x1_bc before this runs.
     """
     try:
         v1 = roles.index(VEL)
@@ -308,10 +311,14 @@ def fill_x1_ghosts(
         out[..., :ng] = out[..., ng : 2 * ng][..., ::-1]
         if v1 is not None:
             out[v1][..., :ng] *= -1.0
+    elif inner == "outflow":
+        out[..., :ng] = out[..., ng : ng + 1]
     if outer == "reflecting":
         out[..., -ng:] = out[..., -2 * ng : -ng][..., ::-1]
         if v1 is not None:
             out[v1][..., -ng:] *= -1.0
+    elif outer == "outflow":
+        out[..., -ng:] = out[..., -ng - 1 : -ng]
 
 
 def regrid_state(
@@ -325,6 +332,7 @@ def regrid_state(
     zero_above: list = (),
     bc: tuple = ("", ""),
     isothermal_tol: float = 0.10,
+    dtype: np.dtype | None = None,
 ) -> np.ndarray:
     """Map one (nvar, nc3, nc2, nc1) array onto the new grid.
 
@@ -363,8 +371,18 @@ def regrid_state(
     # can be measured.
     if not conserved and new.x1max > old.x1max and EOP in roles:
         pre = roles.index(EOP)
-        window = min(nfit, src.shape[-1])
+        # The same window fit_top_slope will use, so the guard describes the
+        # cells the extension is actually built from.
+        window = int(max(2, min(nfit, src.shape[-1])))
         t_edge = (src[pre] / rho)[..., -window:]
+        # x1 is already cut to the active range, but x2 and x3 still carry
+        # their ghosts, and a mirrored or stale ghost is not part of the column
+        # whose lapse rate this is measuring.
+        gh = old.nghost
+        if t_edge.shape[-2] > 2 * gh:
+            t_edge = t_edge[..., gh:-gh, :]
+        if t_edge.shape[-3] > 2 * gh:
+            t_edge = t_edge[gh:-gh, ...]
         lo, hi = float(np.min(t_edge)), float(np.max(t_edge))
         spread = (hi - lo) / hi if hi > 0 else float("inf")
         print(
@@ -386,39 +404,25 @@ def regrid_state(
     out = np.empty(src.shape[:-1] + (new.nc1,), dtype=np.float64)
     out[0] = rho_new
 
-    # Velocities first: the conserved energy is rebuilt from them, so they have
-    # to be the same numbers that get written back as momentum.
+    # Everything below rides in per-mass form: velocity, specific internal
+    # energy, P/rho, mass fractions. Those are the quantities that interpolate
+    # without contradicting each other, and the conserved array is rebuilt from
+    # them once, after the horizontal resample. Converting earlier would leave
+    # resample_x2_periodic interpolating momentum and energy independently,
+    # which is exactly what carrying E/rho through x1 got wrong.
     vel_slots = [v for v in range(1, src.shape[0]) if roles[v] == VEL]
-    vel_new = {}
-    for v in vel_slots:
-        source = src[v] / rho if conserved else src[v]
-        vel_new[v] = map_x1(source, z_old, z_new, False, nfit)
-
     for v in range(1, src.shape[0]):
         role = roles[v]
-        # Momentum and tracer densities are rho times a per-unit-mass quantity,
-        # and that quantity is what stays smooth. Pressure is the same case:
-        # carrying P/rho rather than P keeps the extension isothermal, where
-        # extrapolating log(P) and log(rho) along separately fitted slopes lets
-        # their small mismatch drift the temperature (194 K instead of 255 K
-        # over 160 km, on one test).
-        if role == VEL:
-            out[v] = vel_new[v] * rho_new if conserved else vel_new[v]
-        elif role == EOP and conserved:
+        if role == EOP and conserved:
             # Total energy per mass is e + |v|^2/2, and interpolation does not
-            # commute with squaring the velocity: carrying E/rho across and
-            # multiplying by the new density gives an energy that no longer
-            # matches the momentum beside it, which the EOS then reads as a
-            # different pressure. Carry the internal energy, which is the
-            # thermodynamic part, and rebuild the total from the velocities
-            # this function is writing.
+            # commute with squaring the velocity. Carry the internal energy,
+            # which is the thermodynamic part.
             ke_src = 0.5 * sum((src[k] / rho) ** 2 for k in vel_slots)
-            e_src = src[v] / rho - ke_src
-            e_new = map_x1(e_src, z_old, z_new, False, nfit)
-            ke_new = 0.5 * sum(vel_new[k] ** 2 for k in vel_slots)
-            out[v] = (e_new + ke_new) * rho_new
-        elif role == EOP or (conserved and role == FRAC):
-            out[v] = map_x1(src[v] / rho, z_old, z_new, False, nfit) * rho_new
+            out[v] = map_x1(src[v] / rho - ke_src, z_old, z_new, False, nfit)
+        elif conserved or role == EOP:
+            # Momentum, tracer densities and pressure are all rho times
+            # something smooth; that something is what gets mapped.
+            out[v] = map_x1(src[v] / rho, z_old, z_new, False, nfit)
         else:
             out[v] = map_x1(src[v], z_old, z_new, False, nfit)
 
@@ -435,18 +439,36 @@ def regrid_state(
     if new.nc2 != old.nc2:
         out = resample_x2_periodic(out, new.nc2, new.nghost)
 
-    # The extension extrapolates a fitted log slope, which overflows if the
-    # slope is wrong by enough, and a sign flip in density is unphysical
-    # whatever produced it.
-    if not np.all(np.isfinite(out)):
-        bad = int(np.count_nonzero(~np.isfinite(out)))
+    # Back to the conserved form, from the density that came out of the same
+    # two maps as everything beside it.
+    if conserved:
+        ke = 0.5 * sum(out[k] ** 2 for k in vel_slots)
+        for v in range(1, out.shape[0]):
+            if roles[v] == EOP:
+                out[v] = (out[v] + ke) * out[0]
+            else:
+                out[v] *= out[0]
+    else:
+        for v in range(1, out.shape[0]):
+            if roles[v] == EOP:
+                out[v] *= out[0]
+
+    # Check what will be written, not the float64 working copy: a value the
+    # extrapolation pushed past the output type's range becomes an infinity in
+    # the cast, after a float64 check has already passed it.
+    checked = out.astype(dtype, copy=False) if dtype is not None else out
+    if not np.all(np.isfinite(checked)):
+        bad = int(np.count_nonzero(~np.isfinite(checked)))
         raise ValueError(
-            f"regridded state holds {bad} non-finite value(s); refusing to write "
-            "it. The extension extrapolates a fitted slope, so check --edge-fit "
-            "and --edge-skip against the top of the source column"
+            f"regridded state holds {bad} value(s) that are not finite in "
+            f"{np.dtype(dtype).name if dtype is not None else 'float64'}; refusing "
+            "to write it. The extension extrapolates a fitted slope, so check "
+            "--edge-fit and --edge-skip against the top of the source column"
         )
-    if np.any(out[0] <= 0.0):
-        raise ValueError("regridded state holds non-positive density; refusing to write it")
+    if np.any(checked[0] <= 0.0):
+        raise ValueError(
+            "regridded state holds non-positive density; refusing to write it"
+        )
     return out
 
 
@@ -730,6 +752,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 zero,
                 bc,
                 float("inf") if args.allow_nonisothermal else 0.10,
+                # the type the result is stored back as, not the float64 the
+                # arithmetic runs in
+                torch.empty(0, dtype=tensor.dtype).numpy().dtype,
             )
             tensors[key] = torch.from_numpy(out).to(tensor.dtype)
             print(
