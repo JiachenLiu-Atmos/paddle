@@ -226,3 +226,173 @@ def test_nx2_change_is_accepted_with_stretch(source) -> None:
         NX2 + 4 + 2 * NGHOST,
         new.nc1,
     )
+
+
+# --- what the review of PR #47 asked to be guarded -------------------------
+
+
+def write_variant(path: Path, grid, mutate) -> None:
+    """The module fixture's column, with one thing changed by `mutate`."""
+    z = grid.x1v()
+    rho = analytic(z)
+    u = np.zeros((NVAR, grid.nc3, grid.nc2, grid.nc1), dtype=np.float64)
+    u[0] = rho
+    u[1] = rho * 3.0
+    u[4] = rho * CV_T
+    u[5] = rho * 0.2
+    u[6] = rho * 0.05
+    w = np.zeros_like(u)
+    w[0] = rho
+    w[1] = 3.0
+    w[4] = rho * CV_T * 0.4
+    w[5] = 0.2
+    w[6] = 0.05
+    tensors = {
+        "last_time": torch.tensor([1234.5], dtype=torch.float64),
+        "last_cycle": torch.tensor([678], dtype=torch.int64),
+    }
+    mutate(z, u, w, tensors)
+    tensors.setdefault("hydro_u", torch.from_numpy(u))
+    tensors.setdefault("hydro_w", torch.from_numpy(w))
+    restart_regrid.write_part(tensors, str(path))
+
+
+def case(tmp_path: Path, mutate, old=OLD_CFG, new=NEW_CFG) -> Path:
+    (tmp_path / "old.yaml").write_text(yaml.safe_dump(old))
+    (tmp_path / "new.yaml").write_text(yaml.safe_dump(new))
+    write_variant(tmp_path / "in.restart", restart_regrid.Grid(old), mutate)
+    return tmp_path
+
+
+def test_tracer_bearing_restart_is_refused(tmp_path) -> None:
+    """scalar_s is laid out on x1 but is not regridded, so it must not pass."""
+
+    def add_scalar(z, u, w, tensors):
+        grid = restart_regrid.Grid(OLD_CFG)
+        tensors["scalar_s"] = torch.zeros(
+            (2, grid.nc3, grid.nc2, grid.nc1), dtype=torch.float64
+        )
+
+    src = case(tmp_path, add_scalar)
+    with pytest.raises(SystemExit) as err:
+        run(src, "new.yaml", "out.restart")
+    assert "scalar_s" in str(err.value)
+    assert not (src / "out.restart").exists()
+
+
+def test_energy_stays_consistent_with_the_velocity(tmp_path) -> None:
+    """E/rho - |v|^2/2 must still be the internal energy after the remap.
+
+    Carrying E/rho across and multiplying by the new density does not survive a
+    velocity that varies with height, because interpolation does not commute
+    with squaring it. The column here has a constant internal energy, so the
+    implied value is exactly CV_T wherever the answer is consistent.
+    """
+
+    def shear(z, u, w, tensors):
+        vel = 3.0 + 1.0e-4 * z  # 0 -> 60 m/s over the column
+        u[1] = u[0] * vel
+        u[4] = u[0] * (CV_T + 0.5 * vel**2)
+        w[1] = vel
+
+    src = case(tmp_path, shear)
+    assert run(src, "new.yaml", "out.restart") == 0
+    out = restart_regrid.read_part(str(src / "out.restart"))
+    col = interior(out, "hydro_u")
+    implied = col[4] / col[0] - 0.5 * (col[1] / col[0]) ** 2
+    assert np.allclose(implied, CV_T, rtol=1e-10)
+
+
+def test_periodic_ghosts_wrap_the_active_cells(tmp_path) -> None:
+    periodic = {
+        **config(600.0e3, 142),
+        "boundary-condition": {
+            "external": {"x1-inner": "periodic", "x1-outer": "periodic"}
+        },
+    }
+    new = {
+        **config(760.0e3, 180),
+        "boundary-condition": {
+            "external": {"x1-inner": "periodic", "x1-outer": "periodic"}
+        },
+    }
+    src = case(tmp_path, lambda *a: None, old=periodic, new=new)
+    assert run(src, "new.yaml", "out.restart") == 0
+    arr = restart_regrid.read_part(str(src / "out.restart"))["hydro_u"].numpy()
+    nx1 = restart_regrid.Grid(new).nx1
+    # the lower ghosts hold the topmost active cells, and the reverse
+    assert np.array_equal(arr[..., :NGHOST], arr[..., nx1 : nx1 + NGHOST])
+    assert np.array_equal(arr[..., -NGHOST:], arr[..., NGHOST : 2 * NGHOST])
+
+
+def test_one_sided_periodic_is_refused(tmp_path) -> None:
+    half = {
+        **config(600.0e3, 142),
+        "boundary-condition": {
+            "external": {"x1-inner": "periodic", "x1-outer": "reflecting"}
+        },
+    }
+    src = case(tmp_path, lambda *a: None, old=half, new=half)
+    with pytest.raises(SystemExit, match="both ends"):
+        run(src, "new.yaml", "out.restart")
+
+
+def test_unsupported_boundary_is_refused(tmp_path) -> None:
+    odd = {
+        **config(600.0e3, 142),
+        "boundary-condition": {
+            "external": {"x1-inner": "shear-periodic", "x1-outer": "reflecting"}
+        },
+    }
+    src = case(tmp_path, lambda *a: None, old=odd, new=odd)
+    with pytest.raises(SystemExit, match="does not rebuild"):
+        run(src, "new.yaml", "out.restart")
+
+
+def test_ghost_width_change_is_refused(tmp_path) -> None:
+    wider = config(760.0e3, 180)
+    wider["geometry"]["cells"]["nghost"] = 2
+    src = case(tmp_path, lambda *a: None, new=wider)
+    with pytest.raises(SystemExit, match="nghost must be unchanged"):
+        run(src, "new.yaml", "out.restart")
+
+
+def test_non_finite_input_is_refused(tmp_path) -> None:
+    def poison(z, u, w, tensors):
+        u[0, 0, NGHOST, NGHOST + 10] = np.nan
+
+    src = case(tmp_path, poison)
+    with pytest.raises(ValueError, match="non-finite"):
+        run(src, "new.yaml", "out.restart")
+    assert not (src / "out.restart").exists()
+
+
+def test_existing_output_is_kept_unless_forced(tmp_path) -> None:
+    src = case(tmp_path, lambda *a: None)
+    (src / "out.restart").write_bytes(b"do not lose me")
+    with pytest.raises(SystemExit, match="already exists"):
+        run(src, "new.yaml", "out.restart")
+    assert (src / "out.restart").read_bytes() == b"do not lose me"
+    assert run(src, "new.yaml", "out.restart", "--force") == 0
+    assert (src / "out.restart").read_bytes() != b"do not lose me"
+
+
+def test_input_and_output_must_differ(tmp_path) -> None:
+    src = case(tmp_path, lambda *a: None)
+    before = (src / "in.restart").read_bytes()
+    with pytest.raises(SystemExit, match="same file"):
+        run(src, "new.yaml", "in.restart")
+    assert (src / "in.restart").read_bytes() == before
+
+
+def test_non_isothermal_edge_is_refused_then_allowed(tmp_path) -> None:
+    """A column with a real lapse rate cannot get an isothermal extension."""
+
+    def lapse(z, u, w, tensors):
+        # P/rho falls with height instead of staying flat
+        w[4] = u[0] * CV_T * 0.4 * (1.0 - 0.6 * z / 600.0e3)
+
+    src = case(tmp_path, lapse)
+    with pytest.raises(ValueError, match="hydrostatic balance"):
+        run(src, "new.yaml", "out.restart")
+    assert run(src, "new.yaml", "out.restart", "--allow-nonisothermal") == 0

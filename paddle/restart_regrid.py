@@ -31,7 +31,36 @@ What is mapped, and how:
 
 Conserved variables are rebuilt as rho times the per-unit-mass quantity, so the
 new state is consistent by construction rather than interpolated component by
-component.
+component. Total energy is the one that needs care: it is carried as the
+internal energy e = E/rho - |v|^2/2 and rebuilt from the interpolated
+velocities, because interpolating E/rho directly does not commute with squaring
+v and leaves an energy the EOS reads as a different pressure.
+
+What this does not do:
+
+  other spatial  only the four hydro arrays are regridded. A restart carrying
+  fields         anything else on the x1 axis, scalar_s above all, is refused
+                 rather than written out at two different vertical sizes.
+  hydrostatic    the extension is isothermal at the edge temperature and fits
+  balance        the source density slope. Those agree only where the source is
+                 itself near-isothermal, so the top --edge-fit cells are
+                 measured and a column with more than 10% spread in P/rho is
+                 refused unless --allow-nonisothermal is given. Nothing here
+                 reads gravity, so balance is never verified, only approximated.
+  conservation   nothing enforces a global budget. Column mass and energy
+                 change by the interpolation error plus whatever the extension
+                 adds.
+  ghost width    nghost must be unchanged: x1 is extracted with the old width
+                 while x2 is resampled with the new one, and x3 is never
+                 rebuilt.
+  grid spacing   cell centres are computed as uniform arithmetic centres from
+                 the YAML bounds. Non-uniform or geometry-specific grids are
+                 not supported.
+
+x1 ghost zones are rebuilt for reflecting walls and periodic seams; outflow
+keeps the smooth extrapolation, which is what a zero-gradient boundary asks
+for. Any other boundary is refused, because Snapy does not refill ghosts when
+it loads a restart and a wrong ghost is read as if it were the real condition.
 
 The x1 ghost zones and the top --edge-skip active cells are dropped from the
 source first. The ghosts only mirror the wall, and the cells against it are not
@@ -45,6 +74,11 @@ resamples x2 periodically. Stretching maps the old domain width onto the new
 one, so existing eddies are rescaled with it: that keeps a run going across a
 width change, it does not preserve the flow.
 
+The output is written to a temporary file in the destination directory and
+renamed into place, so a failure leaves whatever was there before. An existing
+destination is refused unless --force is given, and --restart may not name the
+same file as --output.
+
 Examples:
   paddle-regrid --old-config old.yaml --new-config new.yaml \
       --restart run.final.restart --output run.taller.restart
@@ -56,6 +90,7 @@ import argparse
 import io
 import os
 import sys
+import tempfile
 from typing import Sequence
 
 import numpy as np
@@ -213,6 +248,31 @@ def resample_x2_periodic(arr: np.ndarray, nc2_new: int, ng: int) -> np.ndarray:
     return out
 
 
+# x1 boundary conditions this tool knows how to rebuild ghost zones for. An
+# empty string is a configuration that does not name one.
+SUPPORTED_X1_BC = ("", "reflecting", "periodic", "outflow")
+
+
+def check_x1_bc(inner: str, outer: str) -> None:
+    """Refuse a boundary this tool would silently mistreat.
+
+    Ghosts are part of the restart and Snapy does not refill them on load, so an
+    unrecognised boundary would be written as a smooth extrapolation and read as
+    if it were the real condition.
+    """
+    for side, name in (("x1-inner", inner), ("x1-outer", outer)):
+        if name not in SUPPORTED_X1_BC:
+            raise SystemExit(
+                f"{side} is '{name}', which this tool does not rebuild. Supported: "
+                + ", ".join(repr(b) for b in SUPPORTED_X1_BC if b)
+            )
+    if (inner == "periodic") != (outer == "periodic"):
+        raise SystemExit(
+            f"x1-inner is '{inner}' and x1-outer is '{outer}': periodic has to be "
+            "set on both ends, since each side's ghosts come from the other"
+        )
+
+
 def fill_x1_ghosts(
     out: np.ndarray, ng: int, roles: list, inner: str, outer: str
 ) -> None:
@@ -225,14 +285,25 @@ def fill_x1_ghosts(
     the velocity pointing the wrong way, which reads as inflow through a solid
     wall and threw a six-fold kinetic energy spike into the first day.
 
-    Anything other than a reflecting wall keeps the extrapolation, which is the
-    reasonable neutral choice for outflow and for a periodic seam that the
-    exchange will overwrite anyway.
+    A periodic seam stores the active cells from the opposite end. The same
+    argument applies: the extrapolation is not that, and because the loader
+    does not refill, no later exchange is guaranteed to correct it.
+
+    Outflow keeps the extrapolation, which is what a zero-gradient boundary
+    asks for. Anything else is rejected by check_x1_bc before this runs.
     """
     try:
         v1 = roles.index(VEL)
     except ValueError:
         v1 = None
+
+    if inner == "periodic":
+        # The two ends are the same place: the lower ghosts are the topmost
+        # active cells, and the upper ghosts are the lowest active ones.
+        out[..., :ng] = out[..., -2 * ng : -ng]
+        out[..., -ng:] = out[..., ng : 2 * ng]
+        return
+
     if inner == "reflecting":
         out[..., :ng] = out[..., ng : 2 * ng][..., ::-1]
         if v1 is not None:
@@ -253,6 +324,7 @@ def regrid_state(
     nfit: int,
     zero_above: list = (),
     bc: tuple = ("", ""),
+    isothermal_tol: float = 0.10,
 ) -> np.ndarray:
     """Map one (nvar, nc3, nc2, nc1) array onto the new grid.
 
@@ -268,23 +340,84 @@ def regrid_state(
     z_old = old.x1v()[ng : ng + nsrc]
     z_new = new.x1v()
 
+    # `rho <= 0` is False for a NaN, so the positivity test alone lets a
+    # non-finite column through and the log interpolation then spreads it over
+    # the whole output.
+    if not np.all(np.isfinite(src)):
+        bad = int(np.count_nonzero(~np.isfinite(src)))
+        raise ValueError(
+            f"restart holds {bad} non-finite value(s) in the active x1 range; "
+            "refusing to regrid"
+        )
+
     rho = src[0]
     if np.any(rho <= 0.0):
         raise ValueError("restart holds non-positive density; refusing to regrid")
+
+    # The extension fits the density slope and holds P/rho at the edge, which is
+    # an isothermal column at the edge temperature. That is only the hydrostatic
+    # continuation of the source if the source is itself close to isothermal
+    # there: a column with a real lapse rate has a different density scale
+    # height, and the extension then does not satisfy dP/dz = -rho*g. Nothing
+    # here reads gravity, so the gradient of P/rho over the fitted cells is what
+    # can be measured.
+    if not conserved and new.x1max > old.x1max and EOP in roles:
+        pre = roles.index(EOP)
+        window = min(nfit, src.shape[-1])
+        t_edge = (src[pre] / rho)[..., -window:]
+        lo, hi = float(np.min(t_edge)), float(np.max(t_edge))
+        spread = (hi - lo) / hi if hi > 0 else float("inf")
+        print(
+            f"  edge P/rho over the top {window} fitted cells: "
+            f"{lo:.6g} to {hi:.6g} ({100 * spread:.2f}% spread)"
+        )
+        if spread > isothermal_tol:
+            raise ValueError(
+                f"the top {window} source cells span {100 * spread:.1f}% in P/rho, "
+                f"above the {100 * isothermal_tol:.0f}% this tool allows. The "
+                "extension is isothermal at the edge value and fits the density "
+                "slope, so on a column with this much lapse it will not be in "
+                "hydrostatic balance. Narrow --edge-fit to a flatter window, or "
+                "pass --allow-nonisothermal to accept an extension that is not "
+                "hydrostatic."
+            )
 
     rho_new = map_x1(rho, z_old, z_new, True, nfit)
     out = np.empty(src.shape[:-1] + (new.nc1,), dtype=np.float64)
     out[0] = rho_new
 
+    # Velocities first: the conserved energy is rebuilt from them, so they have
+    # to be the same numbers that get written back as momentum.
+    vel_slots = [v for v in range(1, src.shape[0]) if roles[v] == VEL]
+    vel_new = {}
+    for v in vel_slots:
+        source = src[v] / rho if conserved else src[v]
+        vel_new[v] = map_x1(source, z_old, z_new, False, nfit)
+
     for v in range(1, src.shape[0]):
         role = roles[v]
-        # Momentum, total energy and tracer densities are all rho times a
-        # per-unit-mass quantity, and that quantity is what stays smooth.
-        # Pressure is the same case: carrying P/rho rather than P keeps the
-        # extension isothermal, where extrapolating log(P) and log(rho) along
-        # separately fitted slopes lets their small mismatch drift the
-        # temperature (194 K instead of 255 K over 160 km, on one test).
-        if role == EOP or (conserved and role in (VEL, FRAC)):
+        # Momentum and tracer densities are rho times a per-unit-mass quantity,
+        # and that quantity is what stays smooth. Pressure is the same case:
+        # carrying P/rho rather than P keeps the extension isothermal, where
+        # extrapolating log(P) and log(rho) along separately fitted slopes lets
+        # their small mismatch drift the temperature (194 K instead of 255 K
+        # over 160 km, on one test).
+        if role == VEL:
+            out[v] = vel_new[v] * rho_new if conserved else vel_new[v]
+        elif role == EOP and conserved:
+            # Total energy per mass is e + |v|^2/2, and interpolation does not
+            # commute with squaring the velocity: carrying E/rho across and
+            # multiplying by the new density gives an energy that no longer
+            # matches the momentum beside it, which the EOS then reads as a
+            # different pressure. Carry the internal energy, which is the
+            # thermodynamic part, and rebuild the total from the velocities
+            # this function is writing.
+            ke_src = 0.5 * sum((src[k] / rho) ** 2 for k in vel_slots)
+            e_src = src[v] / rho - ke_src
+            e_new = map_x1(e_src, z_old, z_new, False, nfit)
+            ke_new = 0.5 * sum(vel_new[k] ** 2 for k in vel_slots)
+            out[v] = (e_new + ke_new) * rho_new
+        elif role == EOP or (conserved and role == FRAC):
             out[v] = map_x1(src[v] / rho, z_old, z_new, False, nfit) * rho_new
         else:
             out[v] = map_x1(src[v], z_old, z_new, False, nfit)
@@ -301,6 +434,19 @@ def regrid_state(
 
     if new.nc2 != old.nc2:
         out = resample_x2_periodic(out, new.nc2, new.nghost)
+
+    # The extension extrapolates a fitted log slope, which overflows if the
+    # slope is wrong by enough, and a sign flip in density is unphysical
+    # whatever produced it.
+    if not np.all(np.isfinite(out)):
+        bad = int(np.count_nonzero(~np.isfinite(out)))
+        raise ValueError(
+            f"regridded state holds {bad} non-finite value(s); refusing to write "
+            "it. The extension extrapolates a fitted slope, so check --edge-fit "
+            "and --edge-skip against the top of the source column"
+        )
+    if np.any(out[0] <= 0.0):
+        raise ValueError("regridded state holds non-positive density; refusing to write it")
     return out
 
 
@@ -341,6 +487,52 @@ def read_restart(path: str) -> list:
             index.append((name, int(size)))
         f.readline()  # blank terminator
         return [(name, read_part(io.BytesIO(f.read(size)))) for name, size in index]
+
+
+def resolve_paths(restart: str, output: str, force: bool) -> tuple[str, str]:
+    """Refuse to read and write the same file, or to clobber one by accident.
+
+    The writer truncates its destination, so an output that already holds a
+    restart is gone the moment it opens, and `--restart x --output x` destroys
+    the only copy of the state. The sibling resize command already refuses
+    both; this is the same check.
+    """
+    source = os.path.realpath(os.path.expanduser(restart))
+    target = os.path.realpath(os.path.expanduser(output))
+    if not os.path.isfile(source):
+        raise SystemExit(f"input restart does not exist: {source}")
+    if source == target:
+        raise SystemExit(
+            f"--restart and --output are the same file ({source}); writing would "
+            "destroy the state being read"
+        )
+    parent = os.path.dirname(target) or "."
+    if not os.path.isdir(parent):
+        raise SystemExit(f"output directory does not exist: {parent}")
+    if os.path.exists(target) and not force:
+        raise SystemExit(
+            f"output restart already exists: {target}; pass --force to replace it"
+        )
+    return source, target
+
+
+def publish(blocks: list, path: str) -> None:
+    """Write to a temporary file in the destination directory, then rename.
+
+    A failure part way through a direct write leaves a truncated restart where
+    a good one may have been. Renaming within one directory is atomic, so the
+    destination either holds the old file or the complete new one.
+    """
+    parent = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=parent, prefix=".regrid-", suffix=".restart")
+    os.close(fd)
+    try:
+        write_restart(blocks, tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 def write_restart(blocks: list, path: str) -> None:
@@ -407,7 +599,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--reset-time", action="store_true", help="resume at t = 0, cycle 0"
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="replace --output if it already exists",
+    )
+    parser.add_argument(
+        "--allow-nonisothermal",
+        action="store_true",
+        help="extend above a source whose edge is not close to isothermal, "
+        "accepting that the extension is not in hydrostatic balance",
+    )
     args = parser.parse_args(argv)
+
+    src_path, out_path = resolve_paths(args.restart, args.output, args.force)
 
     with open(args.old_config) as f:
         old = Grid(yaml.safe_load(f))
@@ -423,6 +628,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if old.nx3 != new.nx3:
         raise SystemExit(f"nx3 must be unchanged ({old.nx3} -> {new.nx3})")
+    if old.nghost != new.nghost:
+        raise SystemExit(
+            f"nghost must be unchanged ({old.nghost} -> {new.nghost}): x1 is "
+            "extracted with the old ghost width while x2 is resampled with the "
+            "new one, and x3 is never rebuilt, so a changed width writes an "
+            "array the new configuration cannot hold"
+        )
     if old.nx2 != new.nx2 and args.x2_mode != "stretch":
         raise SystemExit(
             f"nx2 changes {old.nx2} -> {new.nx2}; pass --x2-mode stretch to resample x2, "
@@ -437,16 +649,39 @@ def main(argv: Sequence[str] | None = None) -> int:
     ext = (new_cfg.get("boundary-condition") or {}).get("external") or {}
     bc = (str(ext.get("x1-inner", "")), str(ext.get("x1-outer", "")))
     print(f"x1 boundaries: inner {bc[0] or 'unset'}, outer {bc[1] or 'unset'}")
+    check_x1_bc(*bc)
 
-    blocks = read_restart(args.restart)
-    print(f"read {len(blocks)} block(s) from {args.restart}")
+    blocks = read_restart(src_path)
+    print(f"read {len(blocks)} block(s) from {src_path}")
+
+    # Only the hydro arrays are regridded below. Any other tensor laid out on
+    # the x1 axis would be copied through at the old length, and the result
+    # would hold two different vertical sizes: Snapy cannot continue from that,
+    # and nothing downstream would say so.
+    handled = set(CONSERVED_KEYS) | set(PRIMITIVE_KEYS)
+    stale = []
+    for name, tensors in blocks:
+        for key in sorted(tensors):
+            if key in handled:
+                continue
+            shape = tuple(tensors[key].shape)
+            if len(shape) >= 2 and shape[-1] == old.nc1:
+                stale.append(f"{key}{list(shape)}" + (f" in {name}" if name else ""))
+    if stale:
+        raise SystemExit(
+            "this restart holds spatial field(s) on the x1 axis that this tool "
+            "does not regrid: " + ", ".join(stale) + ". Regridding only the hydro "
+            "arrays would leave the output with two different vertical sizes. "
+            "Tracers carried in scalar_s and saved boundary states are the usual "
+            "cases; they need their own mapping rule before this is safe."
+        )
     for name, tensors in blocks:
         missing = [
             k for k in ("hydro_u", "last_time", "last_cycle") if k not in tensors
         ]
         if missing:
             raise SystemExit(
-                f"{name or args.restart} is missing {', '.join(missing)}; refusing to "
+                f"{name or src_path} is missing {', '.join(missing)}; refusing to "
                 "write a restart Snapy cannot load"
             )
     if len(blocks) > 1:
@@ -485,7 +720,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else condensate_slots(new_cfg, arr.shape[0], args.index_scheme)
             )
             out = regrid_state(
-                arr, old, new, roles, conserved, args.edge_skip, args.edge_fit, zero, bc
+                arr,
+                old,
+                new,
+                roles,
+                conserved,
+                args.edge_skip,
+                args.edge_fit,
+                zero,
+                bc,
+                float("inf") if args.allow_nonisothermal else 0.10,
             )
             tensors[key] = torch.from_numpy(out).to(tensor.dtype)
             print(
@@ -501,8 +745,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"cycle={tensors['last_cycle'].item()}"
         )
 
-    write_restart(blocks, args.output)
-    print(f"wrote {args.output} ({os.path.getsize(args.output) / 1e6:.2f} MB)")
+    publish(blocks, out_path)
+    print(f"wrote {out_path} ({os.path.getsize(out_path) / 1e6:.2f} MB)")
     return 0
 
 
