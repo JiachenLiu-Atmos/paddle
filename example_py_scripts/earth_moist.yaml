@@ -28,7 +28,6 @@ geometry:
   cells: {nx1: 100, nx2: 1, nx3: 1, nghost: 3}
 
 dynamics:
-  disable: true
   equation-of-state:
     type: ideal-moist
     density-floor: 1.e-10
