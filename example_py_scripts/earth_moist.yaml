@@ -33,12 +33,7 @@ dynamics:
     type: ideal-moist
     density-floor: 1.e-10
     pressure-floor: 1.e-10
-    tracer-floor: 1.e-10
     limiter: true
-
-  vertical-projection:
-    type: temperature
-    pressure-margin: 1.e-6
 
   reconstruct:
     vertical: {type: weno5, scale: false, shock: false}

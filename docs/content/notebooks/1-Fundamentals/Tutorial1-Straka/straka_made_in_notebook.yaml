@@ -17,9 +17,6 @@ dynamics:
     type: ideal-gas
     gammad: 1.4
     weight: 0.0293
-  vertical-projection:
-    type: temperature
-    pressure-margin: 1.0e-06
   reconstruct:
     vertical:
       type: weno5

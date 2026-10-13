@@ -22,10 +22,6 @@ dynamics:
     weight: 29.e-3
     limiter: false
 
-  vertical-projection:
-    type: temperature
-    pressure-margin: 1.e-6
-
   reconstruct:
     vertical: {type: weno5, scale: false, shock: false}
     horizontal: {type: weno5, scale: false, shock: false}
