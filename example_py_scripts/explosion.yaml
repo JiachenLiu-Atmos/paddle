@@ -22,8 +22,8 @@ dynamics:
     limiter: false
 
   reconstruct:
-    vertical: {type: weno5, scale: false, shock: true}
-    horizontal: {type: weno5, scale: false, shock: true}
+    vertical: {type: plm}
+    horizontal: {type: plm}
 
   riemann-solver:
     type: hllc
