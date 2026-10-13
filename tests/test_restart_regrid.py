@@ -452,7 +452,9 @@ def test_guard_window_matches_the_slope_fit(tmp_path, capsys) -> None:
     assert run(src, "new.yaml", "out.restart", "--edge-fit", "1") == 0
     reported = capsys.readouterr().out
     assert "over the top 2 fitted cells" in reported
-    assert restart_regrid.fit_top_slope(np.arange(5.0), np.arange(5.0), 1) == pytest.approx(1.0)
+    assert restart_regrid.fit_top_slope(
+        np.arange(5.0), np.arange(5.0), 1
+    ) == pytest.approx(1.0)
 
 
 def test_outflow_ghosts_hold_the_edge_value(tmp_path) -> None:
